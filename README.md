@@ -1,3 +1,12 @@
+<p align="center">
+  <a href="./README.md">
+    <img src="https://img.shields.io/badge/Language-English-blue?style=for-the-badge" alt="English">
+  </a>
+  <a href="./README.fa.md">
+    <img src="https://img.shields.io/badge/زبان-فارسی-green?style=for-the-badge" alt="فارسی">
+  </a>
+</p>
+
 # # **Doctor Appointment Watcher**
 
 A lightweight Python tool that monitors supported doctor appointment pages and sends a Telegram notification when an available appointment is detected.
