@@ -38,7 +38,8 @@ Clone the repository:
 git clone https://github.com/hosseinzamaninasab/doctor-appointment-watcher.git
 cd doctor-appointment-watcher
 Install dependencies:
-pip install -r requirements.txt
+python appointment_watcher.py
+
 The program will guide you through the required configuration.
 You provide:
 1. Doctor appointment page URL
