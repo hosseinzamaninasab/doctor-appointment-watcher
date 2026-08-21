@@ -58,7 +58,7 @@ Doctor URL:
 > https://doctoreto.com/doctor/...
 
 Doctor name:
-> دکتر علی سعیدپور پاریزی
+> نام و نام خانوادگی دکتر مد نظر
 
 Telegram bot token:
 > ********
