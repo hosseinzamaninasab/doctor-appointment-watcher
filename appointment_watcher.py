@@ -615,16 +615,50 @@ def record_error(config: dict[str, str], error: Exception) -> None:
 
     save_json(STATE_FILE, state)
 
+def show_main_menu() -> str:
+    print("\n=== Doctor Appointment Watcher ===\n")
+    print("1) Start watcher")
+    print("2) Configure another doctor")
+    print("3) Exit")
+
+    choice = input("\nChoose an option [1]: ").strip() or "1"
+
+    if choice not in {"1", "2", "3"}:
+        raise WatcherError("Invalid menu selection.")
+
+    return choice
+
+
+def config_exists() -> bool:
+    config = load_json(CONFIG_FILE, {})
+
+    required_keys = (
+        "doctor_name",
+        "doctor_id",
+        "doctor_url",
+        "bot_token",
+        "chat_id",
+    )
+
+    return all(str(config.get(key, "")).strip() for key in required_keys)
+
+
+def reset_state() -> None:
+    try:
+        STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Watch a Doctoreto doctor and notify Telegram."
+        description="Watch a supported doctor appointment page and notify Telegram."
     )
 
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Configure doctor and Telegram settings.",
+        help="Configure a doctor and Telegram settings.",
     )
     parser.add_argument(
         "--test",
@@ -641,22 +675,53 @@ def main() -> int:
 
     try:
         if args.setup:
+            reset_state()
             setup()
             return 0
 
-        config = load_config()
-
         if args.test:
+            config = load_config()
+
             send_telegram(
                 config["bot_token"],
                 config["chat_id"],
                 (
-                    "✅ Test message received.\n\n"
+                    "Test message received.\n\n"
                     f"Doctor: {config['doctor_name']}"
                 ),
             )
             print("Test message sent.")
             return 0
+
+        if args.once:
+            config = load_config()
+
+            try:
+                check_once(config)
+            except Exception as exc:
+                record_error(config, exc)
+
+            return 0
+
+        # First run: automatically start initial setup.
+        if not config_exists():
+            print("\nNo configuration found. Starting initial setup...")
+            setup()
+            return 0
+
+        # Later runs: configuration already exists, so show the menu.
+        choice = show_main_menu()
+
+        if choice == "2":
+            reset_state()
+            setup()
+            return 0
+
+        if choice == "3":
+            print("Goodbye.")
+            return 0
+
+        config = load_config()
 
         interval = int(
             load_json(CONFIG_FILE, {}).get(
@@ -675,9 +740,6 @@ def main() -> int:
                 check_once(config)
             except Exception as exc:
                 record_error(config, exc)
-
-            if args.once:
-                return 0
 
             time.sleep(interval)
 
