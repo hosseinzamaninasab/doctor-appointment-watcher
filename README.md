@@ -1,10 +1,7 @@
 <p align="center">
-  <a href="./README.md">
-    <img src="https://img.shields.io/badge/Language-English-blue?style=for-the-badge" alt="English">
-  </a>
-  <a href="./README.fa.md">
-    <img src="https://img.shields.io/badge/زبان-فارسی-green?style=for-the-badge" alt="فارسی">
-  </a>
+  <a href="./README.md">🇬🇧 English</a>
+  &nbsp;•&nbsp;
+  <a href="./README.fa.md">🇮🇷 فارسی</a>
 </p>
 
 # # **Doctor Appointment Watcher**
