@@ -1,10 +1,10 @@
-Doctor Appointment Watcher
+# # **Doctor Appointment Watcher**
 
 A lightweight Python tool that monitors supported doctor appointment pages and sends a Telegram notification when an available appointment is detected.
 
-The project currently supports DoctorTo and is designed to gradually support more appointment platforms through community contributions.
+The project currently supports **DoctorTo** and is designed to gradually support more appointment platforms through community contributions.
 
-Features
+## **Features**
 
 * Monitor a doctor’s appointment page automatically
 * Detect newly available appointments
@@ -17,38 +17,40 @@ Features
 * Termux-friendly
 * Uses only the Python standard library
 * Designed for community-driven support for additional platforms
+## **Supported Platforms**
 
-Supported Platforms
-
-Platform	Status
-DoctorTo (doctoreto.com)	✅ Supported
-Paziresh24 (paziresh24.com)	🚧 Planned
-Other platforms	🤝 Community contributions welcome
-
-Requirements
+|  **Platform**  |  **Status**  | 
+|---|---|
+|  DoctorTo (`doctoreto.com`)  |  ✅ Supported  | 
+|  Paziresh24 (`paziresh24.com`)  |  🚧 Planned  | 
+|  Other platforms  |  🤝 Community contributions welcome  |
+## **Requirements**
 
 * Termux on Android
 * Internet connection
 * A supported doctor’s appointment page
 * A Telegram bot
-
 Python does not need to be installed manually. The setup script checks for Python and installs it automatically when necessary.
 
-Installation
+## **Installation**
 
 Clone the repository:
 
+```
 git clone https://github.com/hosseinzamaninasab/doctor-appointment-watcher.git
 cd doctor-appointment-watcher
+```
 
 Run the setup script:
 
+```
 chmod +x setup.sh
 ./setup.sh
+```
 
 The setup script prepares the Termux environment and starts the application.
 
-First Run
+## **First Run**
 
 On the first run, no previous configuration exists, so the application automatically starts the initial setup.
 
@@ -60,73 +62,99 @@ You will be asked for:
 4. Telegram chat
 5. Checking interval
 
+⠀
 Example:
 
+```
 === Doctoreto Appointment Watcher Setup ===
+
 Doctor URL:
 > https://doctoreto.com/doctor/...
+
 Doctor name:
 > نام و نام خانوادگی دکتر
+
 Telegram Bot Token:
 > ********
+
 Open your bot in Telegram and press Start.
+
 Setup completed successfully.
+```
 
 The configuration is stored locally so you do not need to enter it every time.
 
-Running the Watcher
+## **Running the Watcher**
 
 After the initial setup, run:
 
+```
 ./setup.sh
+```
 
 or:
 
+```
 python appointment_watcher.py
+```
 
 When an existing configuration is found, the application shows:
 
+```
 === Doctoreto Appointment Watcher ===
+
 1) Start watcher
 2) Configure another doctor
 3) Exit
+```
 
-Start Watcher
+### **Start Watcher**
 
 Select:
 
+```
 1
+```
 
 The current doctor will be monitored.
 
-Configure Another Doctor
+### **Configure Another Doctor**
 
 Select:
 
+```
 2
+```
 
 The previous doctor configuration is replaced with the new one and the previous monitoring state is reset.
 
 This allows the same installation to be reused for another doctor without manually deleting configuration files.
 
-Exit
+### **Exit**
 
 Select:
 
+```
 3
+```
 
-Stop the Watcher
+## **Stop the Watcher**
 
 Press:
 
+```
 Ctrl + C
+```
 
 On Termux, when a physical Ctrl key is not available, you can usually use:
 
+```
 Volume Down + C
+```
 
-How It Works
+## **How It Works**
 
+```
 Doctor URL
     ↓
 Detect supported platform
@@ -145,10 +173,11 @@ New appointment?
   ↓          ↓
 Telegram    Continue
 notification
+```
 
 A small local state file is used to prevent duplicate notifications.
 
-Configuration and Privacy
+## **Configuration and Privacy**
 
 The application stores its configuration locally.
 
@@ -158,14 +187,13 @@ The configuration may contain:
 * Doctor URL
 * Telegram bot token
 * Telegram chat ID
-
 The configuration file is protected with restricted file permissions where supported.
 
-Never share or commit your configuration files or Telegram bot token.
+**Never share or commit your configuration files or Telegram bot token.**
 
 If a Telegram bot token is exposed, revoke it immediately using BotFather.
 
-Security
+## **Security**
 
 Never commit:
 
@@ -175,10 +203,9 @@ Never commit:
 * Session credentials
 * API keys
 * Personal configuration files
-
 This project does not require storing medical records or medical history.
 
-Responsible Use
+## **Responsible Use**
 
 This project is intended for personal appointment monitoring.
 
@@ -188,12 +215,11 @@ Users are responsible for complying with:
 * Applicable rate limits
 * Applicable laws and regulations
 * Any restrictions imposed by the monitored platform
-
 Use reasonable checking intervals and avoid unnecessary traffic.
 
 The project does not automatically book appointments.
 
-Adding Support for a New Platform
+## **Adding Support for a New Platform**
 
 The long-term goal is to support multiple appointment platforms while keeping the user experience simple.
 
@@ -207,12 +233,11 @@ Contributors can help by implementing the website-specific logic required to:
 * Extract appointment information
 * Determine availability
 * Normalize the result into the common appointment format
-
 Shared monitoring, configuration and Telegram logic should remain platform-independent.
 
-See CONTRIBUTING.md for contribution guidelines.
+See `CONTRIBUTING.md` for contribution guidelines.
 
-Contributing
+## **Contributing**
 
 Contributions are welcome.
 
@@ -225,14 +250,18 @@ To add support for a new appointment platform:
 5. Update the supported-platform documentation
 6. Submit a Pull Request
 
+⠀
 Example:
 
+```
 git checkout -b feature/add-new-platform
+```
 
 Please keep platform-specific logic isolated and avoid unnecessary changes to the core application.
 
-Project Structure
+## **Project Structure**
 
+```
 doctor-appointment-watcher/
 │
 ├── appointment_watcher.py
@@ -240,8 +269,9 @@ doctor-appointment-watcher/
 ├── README.md
 ├── CONTRIBUTING.md
 └── LICENSE
+```
 
-Roadmap
+## **Roadmap**
 
 * DoctorTo support
 * Telegram notifications
@@ -256,8 +286,7 @@ Roadmap
 * Automated tests
 * Improved error handling
 * Cross-platform setup support
-
-Disclaimer
+## **Disclaimer**
 
 This project is an independent open-source project.
 
@@ -267,8 +296,8 @@ Appointment availability may change at any time.
 
 The project does not guarantee successful appointment booking.
 
-License
+## **License**
 
 This project is licensed under the MIT License.
 
-See LICENSE for details.
+See `LICENSE` for details.
