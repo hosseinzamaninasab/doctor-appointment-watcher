@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Doctoreto Appointment Watcher.
+"""Doctor Appointment Watcher.
 
 A Termux-friendly watcher that:
-- accepts a Doctoreto doctor URL during setup,
-- extracts the doctor ID automatically,
+- accepts doctor URLs from supported providers (Doctoreto, Paziresh24),
+- extracts doctor IDs automatically,
 - tries to detect the doctor's Persian name from the page,
-- accepts a Persian name manually if auto-detection fails,
 - configures Telegram automatically after the user presses Start,
-- checks appointments periodically and notifies Telegram on changes.
+- checks all configured providers periodically, compares availability in the
+  terminal and notifies Telegram per provider when appointments appear.
+
+Booking always happens on the official provider website; this tool never
+books automatically and never sends credentials to any provider.
 
 Standard library only.
 """
@@ -16,36 +19,41 @@ from __future__ import annotations
 
 import argparse
 import getpass
-import gzip
 import json
 import os
-import re
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
-from urllib.request import Request, urlopen
+from urllib.parse import urlencode
+
+from providers import DEFAULT_PROVIDER, REGISTRY, get_provider, provider_for_url
+from providers.base import (
+    WatcherError,
+    WatcherHTTPError,
+    request_json,
+)
+from providers.model import (
+    Appointment,
+    describe_item,
+    normalize_items,
+    signature_for_items,
+)
 
 
 CHECK_INTERVAL_SECONDS = 10 * 60
-REQUEST_TIMEOUT_SECONDS = 45
-MAX_DOWNLOAD_BYTES = 5 * 1024 * 1024
+MIN_INTERVAL_SECONDS = 60
+ERROR_ALERT_THRESHOLD = 6  # consecutive failures before a Telegram warning
+
+CONFIG_VERSION = 2
+STATE_VERSION = 2
 
 APP_DIR = Path.home() / ".config" / "doctoreto-watcher"
 CONFIG_FILE = APP_DIR / "config.json"
 STATE_FILE = APP_DIR / "state.json"
 
-USER_AGENT = (
-    "Mozilla/5.0 (Linux; Android 13; Mobile) "
-    "AppleWebKit/537.36 Chrome/124.0 Mobile Safari/537.36"
-)
-
-
-class WatcherError(RuntimeError):
-    """A recoverable watcher error."""
+REQUIRED_TARGET_KEYS = ("provider", "doctor_name", "doctor_id", "doctor_url")
 
 
 def log(message: str) -> None:
@@ -53,65 +61,54 @@ def log(message: str) -> None:
     print(f"[{now}] {message}", flush=True)
 
 
-def request_bytes(
-    url: str,
-    *,
-    data: bytes | None = None,
-    headers: dict[str, str] | None = None,
-    attempts: int = 3,
-) -> bytes:
-    request_headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
-    if headers:
-        request_headers.update(headers)
+# ---------------------------------------------------------------------------
+# HTTP / Telegram
+# ---------------------------------------------------------------------------
 
-    last_error: Exception | None = None
-
-    for attempt in range(1, attempts + 1):
-        try:
-            request = Request(url, data=data, headers=request_headers)
-            with urlopen(request, timeout=REQUEST_TIMEOUT_SECONDS) as response:
-                body = response.read(MAX_DOWNLOAD_BYTES + 1)
-
-            if len(body) > MAX_DOWNLOAD_BYTES:
-                raise WatcherError("Website response is too large.")
-
-            return body
-
-        except (HTTPError, URLError, TimeoutError, OSError, WatcherError) as exc:
-            last_error = exc
-            if attempt < attempts:
-                time.sleep(2**attempt)
-
-    raise WatcherError(f"Connection failed: {last_error}")
-
-
-def request_json(
-    url: str,
-    *,
-    data: bytes | None = None,
-    headers: dict[str, str] | None = None,
-) -> dict[str, Any]:
-    raw = request_bytes(url, data=data, headers=headers)
+def _telegram_retry_after(body: bytes | None) -> int | None:
+    """Extract retry_after (seconds) from a Telegram 429 response body."""
+    if not body:
+        return None
 
     try:
-        result = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise WatcherError("Received an invalid JSON response.") from exc
+        data = json.loads(body.decode("utf-8"))
+        seconds = int(data.get("parameters", {}).get("retry_after") or 0)
+    except (AttributeError, TypeError, ValueError, UnicodeDecodeError,
+            json.JSONDecodeError):
+        return None
 
-    if not isinstance(result, dict):
-        raise WatcherError("Received an unexpected JSON structure.")
-
-    return result
+    return seconds if seconds > 0 else None
 
 
 def telegram_api(token: str, method: str, params: dict[str, str]) -> dict[str, Any]:
     payload = urlencode(params).encode("utf-8")
+    url = f"https://api.telegram.org/bot{token}/{method}"
+    headers = {"Content-Type": "application/x-www-form-urlencoded"}
 
-    result = request_json(
-        f"https://api.telegram.org/bot{token}/{method}",
-        data=payload,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-    )
+    result: dict[str, Any] | None = None
+
+    for attempt in (1, 2):
+        try:
+            result = request_json(url, data=payload, headers=headers)
+            break
+        except WatcherHTTPError as exc:
+            # Respect Telegram's 429 retry_after hint once; anything else
+            # (or a repeat 429) propagates to the caller.
+            retry_after = _telegram_retry_after(exc.body)
+
+            if not (
+                attempt == 1
+                and exc.status == 429
+                and retry_after is not None
+                and retry_after <= 120
+            ):
+                raise
+
+            log(f"Telegram rate limit hit; retrying in {retry_after}s.")
+            time.sleep(retry_after)
+
+    if result is None:  # pragma: no cover - defensive
+        raise WatcherError("Telegram request did not return a result.")
 
     if result.get("ok") is not True:
         raise WatcherError(
@@ -132,6 +129,10 @@ def send_telegram(token: str, chat_id: str, text: str) -> None:
         },
     )
 
+
+# ---------------------------------------------------------------------------
+# Local persistence
+# ---------------------------------------------------------------------------
 
 def save_json(path: Path, value: dict[str, Any], *, private: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -159,144 +160,361 @@ def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
         return default.copy()
 
 
-def normalize_doctor_url(url: str) -> str:
-    url = url.strip().split("#", 1)[0].split("?", 1)[0].rstrip("/")
+# ---------------------------------------------------------------------------
+# Configuration (v2) and migration from legacy flat configs
+# ---------------------------------------------------------------------------
 
-    parsed = urlparse(url)
-
-    if parsed.scheme not in {"http", "https"}:
-        raise WatcherError("Doctor URL must start with http:// or https://.")
-
-    if parsed.netloc not in {"doctoreto.com", "www.doctoreto.com"}:
-        raise WatcherError("Please provide a doctoreto.com doctor URL.")
-
-    if "/doctor/" not in parsed.path:
-        raise WatcherError("This does not look like a Doctoreto doctor URL.")
-
-    return url
+def _clean_str(value: Any) -> str:
+    return str(value or "").strip()
 
 
-def extract_doctor_id(url: str) -> str:
-    parsed = urlparse(url)
-    parts = [part for part in parsed.path.split("/") if part]
-
+def _parse_interval(raw: Any) -> int:
     try:
-        doctor_index = parts.index("doctor")
-    except ValueError as exc:
-        raise WatcherError("Could not find the doctor section in the URL.") from exc
+        interval = int(raw)
+    except (TypeError, ValueError):
+        return CHECK_INTERVAL_SECONDS
 
-    if len(parts) <= doctor_index + 2:
-        raise WatcherError("Could not extract the doctor ID from the URL.")
-
-    doctor_id = parts[doctor_index + 2].strip()
-
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", doctor_id):
-        raise WatcherError("The extracted doctor ID contains unexpected characters.")
-
-    return doctor_id
+    return interval if interval >= MIN_INTERVAL_SECONDS else CHECK_INTERVAL_SECONDS
 
 
-def extract_next_data(html_text: str) -> dict[str, Any]:
-    match = re.search(
-        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
-        html_text,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
+def migrate_config(raw: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a raw config dict to the v2 shape.
 
-    if not match:
-        raise WatcherError(
-            "Could not find __NEXT_DATA__ on the doctor page. "
-            "The website structure may have changed."
-        )
+    Legacy flat configs (one doctor, no "targets" key) are converted into a
+    one-entry target list, with the provider inferred from the URL host so
+    existing setups keep working unchanged.
+    """
+    interval = _parse_interval(raw.get("check_interval_seconds"))
 
-    try:
-        value = json.loads(match.group(1))
-    except json.JSONDecodeError as exc:
-        raise WatcherError("Could not parse __NEXT_DATA__.") from exc
+    targets_raw = raw.get("targets")
+    targets: list[dict[str, str]] = []
 
-    if not isinstance(value, dict):
-        raise WatcherError("__NEXT_DATA__ has an unexpected structure.")
+    if isinstance(targets_raw, list):
+        for entry in targets_raw:
+            if not isinstance(entry, dict):
+                continue
+            targets.append(
+                {key: _clean_str(entry.get(key)) for key in REQUIRED_TARGET_KEYS}
+            )
+    else:
+        legacy = {key: _clean_str(raw.get(key)) for key in REQUIRED_TARGET_KEYS}
+        # Legacy configs have no "provider" field; completeness is judged on
+        # the doctor fields only (provider is inferred from the URL below).
+        complete = all(legacy[key] for key in REQUIRED_TARGET_KEYS if key != "provider")
+        targets = [legacy] if complete else []
 
-    return value
+    for target in targets:
+        if not target["provider"]:
+            provider = provider_for_url(target["doctor_url"])
+            target["provider"] = provider.name if provider else DEFAULT_PROVIDER
 
-
-def find_doctor_name(value: Any) -> str | None:
-    """Recursively search common doctor-name fields in page data."""
-    preferred_keys = ("fullName", "full_name", "doctorName", "doctor_name")
-
-    def walk(node: Any) -> str | None:
-        if isinstance(node, dict):
-            for key in preferred_keys:
-                candidate = node.get(key)
-                if isinstance(candidate, str):
-                    candidate = candidate.strip()
-                    if candidate and ("دکتر" in candidate or len(candidate) >= 3):
-                        return candidate
-
-            for key in ("doctor", "data", "items"):
-                if key in node:
-                    found = walk(node[key])
-                    if found:
-                        return found
-
-            for child in node.values():
-                found = walk(child)
-                if found:
-                    return found
-
-        elif isinstance(node, list):
-            for child in node:
-                found = walk(child)
-                if found:
-                    return found
-
-        return None
-
-    return walk(value)
+    return {
+        "bot_token": _clean_str(raw.get("bot_token")),
+        "chat_id": _clean_str(raw.get("chat_id")),
+        "check_interval_seconds": interval,
+        "targets": targets,
+    }
 
 
-def fetch_doctor_page(doctor_url: str) -> str:
-    raw = request_bytes(
-        doctor_url,
-        headers={"Accept": "text/html,application/xhtml+xml"},
-    )
+def load_config() -> dict[str, Any]:
+    config = migrate_config(load_json(CONFIG_FILE, {}))
 
-    # Doctoreto may send gzip even when the client did not explicitly request it.
-    if raw.startswith(b"\x1f\x8b"):
-        try:
-            raw = gzip.decompress(raw)
-        except (OSError, EOFError) as exc:
-            raise WatcherError("The compressed website response is invalid.") from exc
-
-        if len(raw) > MAX_DOWNLOAD_BYTES:
-            raise WatcherError("The decompressed page is too large.")
-
-    try:
-        return raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise WatcherError("The website response is not UTF-8.") from exc
-
-
-def detect_doctor_name(doctor_url: str) -> str | None:
-    html_text = fetch_doctor_page(doctor_url)
-    next_data = extract_next_data(html_text)
-    return find_doctor_name(next_data)
-
-
-def load_config() -> dict[str, str]:
-    config = load_json(CONFIG_FILE, {})
-
-    required_keys = ("doctor_name", "doctor_id", "doctor_url", "bot_token", "chat_id")
-    result = {key: str(config.get(key, "")).strip() for key in required_keys}
-
-    missing = [key for key, value in result.items() if not value]
-    if missing:
+    if not config["targets"]:
         raise WatcherError(
             f"Configuration is incomplete. Run: {Path(sys.argv[0]).name} --setup"
         )
 
-    return result
+    if not config["bot_token"] or not config["chat_id"]:
+        raise WatcherError(
+            f"Configuration is incomplete. Run: {Path(sys.argv[0]).name} --setup"
+        )
 
+    for index, target in enumerate(config["targets"], start=1):
+        for key in REQUIRED_TARGET_KEYS:
+            if not target[key]:
+                raise WatcherError(
+                    "Configuration is incomplete "
+                    f"(target {index} is missing {key}). "
+                    f"Run: {Path(sys.argv[0]).name} --setup"
+                )
+
+        # Unknown provider names must fail loudly, not silently.
+        get_provider(target["provider"])
+
+    return config
+
+
+def config_exists() -> bool:
+    config = migrate_config(load_json(CONFIG_FILE, {}))
+
+    if not config["bot_token"] or not config["chat_id"]:
+        return False
+
+    for target in config["targets"]:
+        if not all(target[key] for key in REQUIRED_TARGET_KEYS):
+            return False
+
+        try:
+            get_provider(target["provider"])
+        except WatcherError:
+            return False
+
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Per-target state (v2): one independent fingerprint per provider + doctor
+# ---------------------------------------------------------------------------
+
+def target_key(target: dict[str, str]) -> str:
+    return f"{target['provider']}:{target['doctor_id']}"
+
+
+def default_target_state() -> dict[str, Any]:
+    return {
+        "last_alert_signature": "",
+        "consecutive_errors": 0,
+        "error_alerted": False,
+        "last_success_at": None,
+    }
+
+
+def load_state(config: dict[str, Any]) -> dict[str, Any]:
+    raw = load_json(STATE_FILE, {})
+
+    if raw.get("version") == STATE_VERSION and isinstance(raw.get("targets"), dict):
+        return raw
+
+    # Legacy flat state: re-attach the fingerprint to the first configured
+    # target so an upgrade does not cause a duplicate notification.
+    state: dict[str, Any] = {"version": STATE_VERSION, "targets": {}}
+
+    if config["targets"]:
+        try:
+            error_count = int(raw.get("consecutive_errors") or 0)
+        except (TypeError, ValueError):
+            error_count = 0
+
+        state["targets"][target_key(config["targets"][0])] = {
+            "last_alert_signature": str(raw.get("last_alert_signature", "")),
+            "consecutive_errors": error_count,
+            "error_alerted": bool(raw.get("error_alerted", False)),
+            "last_success_at": raw.get("last_success_at"),
+        }
+
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    save_json(STATE_FILE, state)
+
+
+def get_target_state(state: dict[str, Any], key: str) -> dict[str, Any]:
+    targets = state.setdefault("targets", {})
+
+    entry = targets.get(key)
+
+    if not isinstance(entry, dict):
+        entry = default_target_state()
+        targets[key] = entry
+
+    return entry
+
+
+def reset_state() -> None:
+    try:
+        STATE_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Watch logic
+# ---------------------------------------------------------------------------
+
+def check_target(
+    config: dict[str, Any],
+    target: dict[str, str],
+    state: dict[str, Any],
+) -> list[Appointment]:
+    """Check one provider target, updating its independent state entry.
+
+    Raises on failure; state is mutated only after a successful check.
+    """
+    provider = get_provider(target["provider"])
+    target_state = get_target_state(state, target_key(target))
+
+    items = provider.fetch_open_appointments(
+        target["doctor_url"], target["doctor_id"]
+    )
+
+    checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    appointments = normalize_items(
+        provider.name,
+        target["doctor_id"],
+        target["doctor_name"],
+        target["doctor_url"],
+        items,
+        checked_at,
+    )
+
+    signature = signature_for_items(appointments)
+
+    if appointments:
+        if signature != target_state.get("last_alert_signature"):
+            send_telegram(
+                config["bot_token"],
+                config["chat_id"],
+                build_alert(target, appointments),
+            )
+            target_state["last_alert_signature"] = signature
+            log(
+                f"[{provider.name}] Appointment available; Telegram "
+                f"notification sent ({len(appointments)} slot(s))."
+            )
+        else:
+            log(
+                f"[{provider.name}] Appointment is still available; "
+                "notification was already sent."
+            )
+    else:
+        target_state["last_alert_signature"] = ""
+        log(f"[{provider.name}] No appointment is currently available.")
+
+    target_state["consecutive_errors"] = 0
+    target_state["error_alerted"] = False
+    target_state["last_success_at"] = checked_at
+
+    return appointments
+
+
+def record_target_error(
+    config: dict[str, Any],
+    target: dict[str, str],
+    error: Exception,
+    state: dict[str, Any],
+) -> None:
+    target_state = get_target_state(state, target_key(target))
+
+    try:
+        count = int(target_state.get("consecutive_errors") or 0) + 1
+    except (TypeError, ValueError):
+        count = 1
+
+    target_state["consecutive_errors"] = count
+
+    log(f"[{target['provider']}] Error ({count} consecutive): {error}")
+
+    # One warning after roughly one hour of continuous failures.
+    if count >= ERROR_ALERT_THRESHOLD and not target_state.get("error_alerted"):
+        try:
+            send_telegram(
+                config["bot_token"],
+                config["chat_id"],
+                (
+                    f"⚠️ پایش نوبت {target['doctor_name']} "
+                    f"({target['provider']}) "
+                    "چند بار پیاپی با خطا مواجه شده است. "
+                    "لطفاً اینترنت یا وضعیت برنامه را بررسی کنید."
+                ),
+            )
+            target_state["error_alerted"] = True
+
+        except Exception as telegram_error:
+            log(f"Failed to send Telegram error notification: {telegram_error}")
+
+
+def check_all(config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Check every configured target independently.
+
+    A failure on one provider never discards results from another provider.
+    """
+    state = load_state(config)
+    results: list[dict[str, Any]] = []
+
+    for target in config["targets"]:
+        entry: dict[str, Any] = {
+            "target": target,
+            "items": [],
+            "error": None,
+        }
+
+        try:
+            entry["items"] = check_target(config, target, state)
+        except Exception as exc:
+            entry["error"] = exc
+            record_target_error(config, target, exc, state)
+
+        results.append(entry)
+
+    save_state(state)
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Presentation
+# ---------------------------------------------------------------------------
+
+def build_alert(target: dict[str, str], items: list[Appointment]) -> str:
+    lines = [
+        f"🚨 نوبت {target['doctor_name']} ({target['provider']}) باز شد!",
+        "",
+    ]
+
+    for item in items:
+        lines.append(f"مطب: {item.clinic}")
+
+        when = " | ".join(part for part in (item.date, item.time) if part)
+
+        if when:
+            lines.append(f"اولین زمان آزاد: {when}")
+
+        lines.append("")
+
+    lines.extend(
+        (
+            "برای رزرو سریع وارد سایت شوید:",
+            target["doctor_url"],
+        )
+    )
+
+    return "\n".join(lines)
+
+
+def comparison_lines(
+    results: list[dict[str, Any]],
+    now_text: str,
+) -> list[str]:
+    lines = [f"=== Appointment comparison ({now_text}) ===", ""]
+
+    for entry in results:
+        target = entry["target"]
+        lines.append(f"{target['provider']} — {target['doctor_name']}")
+
+        if entry["error"] is not None:
+            lines.append(f"  ⚠️ Check failed: {entry['error']}")
+        elif entry["items"]:
+            lines.append(f"  ✅ {len(entry['items'])} open slot(s):")
+            for item in entry["items"]:
+                lines.append(f"  • {describe_item(item)}")
+            lines.append(f"  Book on the official site: {target['doctor_url']}")
+        else:
+            lines.append("  ❌ No open appointments")
+
+        lines.append("")
+
+    return lines
+
+
+def print_comparison(results: list[dict[str, Any]]) -> None:
+    now_text = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M")
+    print("\n".join(comparison_lines(results, now_text)))
+
+
+# ---------------------------------------------------------------------------
+# Interactive setup
+# ---------------------------------------------------------------------------
 
 def choose_telegram_chat(token: str) -> str:
     print("\nOpen your bot in Telegram and press Start (or send /start).")
@@ -355,17 +573,23 @@ def choose_telegram_chat(token: str) -> str:
     return str(chosen["id"])
 
 
-def setup() -> None:
-    print("\n=== Doctoreto Appointment Watcher Setup ===\n")
+def configure_target(raw_url: str) -> dict[str, str]:
+    """Build one watch target from a doctor URL typed by the user."""
+    provider = provider_for_url(raw_url)
 
-    doctor_url = normalize_doctor_url(input("Doctor URL: "))
-    doctor_id = extract_doctor_id(doctor_url)
+    if provider is None:
+        # No provider matched; let the default provider's URL validation
+        # produce the familiar guidance for unsupported or malformed URLs.
+        provider = get_provider(DEFAULT_PROVIDER)
+
+    doctor_url = provider.normalize_url(raw_url)
+    doctor_id = provider.extract_doctor_id(doctor_url)
 
     print("\nChecking the doctor page and trying to detect the doctor's name...")
     detected_name = None
 
     try:
-        detected_name = detect_doctor_name(doctor_url)
+        detected_name = provider.detect_name(doctor_url)
     except WatcherError as exc:
         print(f"Automatic name detection failed: {exc}")
 
@@ -381,7 +605,55 @@ def setup() -> None:
         if not doctor_name:
             raise WatcherError("Doctor name cannot be empty.")
 
-    print(f"\nDoctor ID extracted automatically: {doctor_id}")
+    print(f"Doctor ID extracted automatically: {doctor_id}")
+
+    return {
+        "provider": provider.name,
+        "doctor_name": doctor_name,
+        "doctor_id": doctor_id,
+        "doctor_url": doctor_url,
+    }
+
+
+def collect_targets() -> list[dict[str, str]]:
+    """Ask for one doctor URL per provider until the user submits an empty line."""
+    print(f"Supported providers: {', '.join(sorted(REGISTRY))}")
+    print("Enter a doctor URL for each provider you want to watch.")
+
+    targets: list[dict[str, str]] = []
+
+    while True:
+        suffix = " (empty line to finish)" if targets else ""
+        raw_url = input(f"\nDoctor URL{suffix}: ").strip()
+
+        if not raw_url:
+            if not targets:
+                raise WatcherError("At least one doctor URL is required.")
+
+            return targets
+
+        target = configure_target(raw_url)
+
+        replaced = [t for t in targets if t["provider"] == target["provider"]]
+        targets = [t for t in targets if t["provider"] != target["provider"]]
+        targets.append(target)
+
+        if replaced:
+            print(
+                f"Replaced the previous {target['provider']} doctor "
+                f"({replaced[0]['doctor_name']})."
+            )
+
+        print(
+            f"Added: {target['doctor_name']} ({target['provider']}). "
+            f"{len(targets)} provider(s) configured."
+        )
+
+
+def setup() -> None:
+    print("\n=== Doctor Appointment Watcher Setup ===\n")
+
+    targets = collect_targets()
 
     token = getpass.getpass("\nTelegram Bot Token: ").strip()
 
@@ -405,220 +677,44 @@ def setup() -> None:
     chat_id = choose_telegram_chat(token)
 
     config = {
-        "doctor_name": doctor_name,
-        "doctor_id": doctor_id,
-        "doctor_url": doctor_url,
+        "version": CONFIG_VERSION,
+        "check_interval_seconds": CHECK_INTERVAL_SECONDS,
         "bot_token": token,
         "chat_id": chat_id,
-        "check_interval_seconds": CHECK_INTERVAL_SECONDS,
+        "targets": targets,
     }
 
     save_json(CONFIG_FILE, config, private=True)
 
-    # Reset old availability state when the watched doctor changes.
+    # Fresh state: the watched doctors changed.
     save_json(
         STATE_FILE,
-        {
-            "last_alert_signature": "",
-            "consecutive_errors": 0,
-            "error_alerted": False,
-        },
+        {"version": STATE_VERSION, "targets": {}},
     )
 
+    doctor_list = "\n".join(
+        f"- {t['doctor_name']} ({t['provider']})" for t in targets
+    )
     send_telegram(
         token,
         chat_id,
-        f"✅ Appointment watcher is configured.\n\nDoctor: {doctor_name}",
+        f"✅ Appointment watcher is configured.\n\n{doctor_list}",
     )
 
     print("\nSetup completed successfully.")
     print(f"Configuration saved to: {CONFIG_FILE}")
-    print(f"Doctor: {doctor_name}")
+    print(f"Watching {len(targets)} doctor(s).")
     print("A test message was sent to Telegram.")
 
 
-def extract_open_appointments(
-    html_text: str,
-    doctor_id: str,
-) -> list[dict[str, str]]:
-    next_data = extract_next_data(html_text)
-
-    try:
-        queries = next_data["props"]["pageProps"]["dehydratedState"]["queries"]
-    except (KeyError, TypeError) as exc:
-        raise WatcherError(
-            "Could not locate the appointment data in the page."
-        ) from exc
-
-    consultations: list[dict[str, Any]] | None = None
-
-    if isinstance(queries, list):
-        for query in queries:
-            if not isinstance(query, dict):
-                continue
-
-            key = query.get("queryKey")
-
-            if (
-                isinstance(key, list)
-                and len(key) >= 3
-                and key[:3] == ["consultations", "doctors", doctor_id]
-            ):
-                candidate = query.get("state", {}).get("data", [])
-
-                if isinstance(candidate, list):
-                    consultations = candidate
-                    break
-
-    if consultations is None:
-        raise WatcherError(
-            "Could not find the consultation list for this doctor. "
-            "The website structure may have changed."
-        )
-
-    open_items: list[dict[str, str]] = []
-
-    for consultation in consultations:
-        if not isinstance(consultation, dict):
-            continue
-
-        next_time = consultation.get("nextFreeTime")
-
-        if (
-            not isinstance(next_time, dict)
-            or next_time.get("isAvailable") is not True
-        ):
-            continue
-
-        place = consultation.get("place", {})
-        place_name = (
-            place.get("name", "Clinic")
-            if isinstance(place, dict)
-            else "Clinic"
-        )
-
-        open_items.append(
-            {
-                "id": str(consultation.get("id", "")),
-                "place": str(place_name),
-                "date": str(next_time.get("shamsiDate", "")),
-                "time": str(next_time.get("shamsiTime", "")),
-                "datetime": str(next_time.get("datetime", "")),
-            }
-        )
-
-    return open_items
-
-
-def availability_signature(items: list[dict[str, str]]) -> str:
-    return json.dumps(
-        items,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-
-
-def build_alert(config: dict[str, str], items: list[dict[str, str]]) -> str:
-    lines = [f"🚨 نوبت {config['doctor_name']} باز شد!", ""]
-
-    for item in items:
-        when = " | ".join(
-            part for part in (item["date"], item["time"]) if part
-        )
-
-        lines.append(f"مطب: {item['place']}")
-
-        if when:
-            lines.append(f"اولین زمان آزاد: {when}")
-
-        lines.append("")
-
-    lines.extend(
-        (
-            "برای رزرو سریع وارد سایت شوید:",
-            config["doctor_url"],
-        )
-    )
-
-    return "\n".join(lines)
-
-
-def default_state() -> dict[str, Any]:
-    return {
-        "last_alert_signature": "",
-        "consecutive_errors": 0,
-        "error_alerted": False,
-    }
-
-
-def check_once(config: dict[str, str]) -> bool:
-    state = load_json(STATE_FILE, default_state())
-
-    html_text = fetch_doctor_page(config["doctor_url"])
-    items = extract_open_appointments(html_text, config["doctor_id"])
-    signature = availability_signature(items)
-
-    if items:
-        if signature != state.get("last_alert_signature"):
-            send_telegram(
-                config["bot_token"],
-                config["chat_id"],
-                build_alert(config, items),
-            )
-            state["last_alert_signature"] = signature
-            log(
-                f"Appointment available; Telegram notification sent "
-                f"({len(items)} location(s))."
-            )
-        else:
-            log("Appointment is still available; notification was already sent.")
-    else:
-        state["last_alert_signature"] = ""
-        log("No appointment is currently available.")
-
-    state["consecutive_errors"] = 0
-    state["error_alerted"] = False
-    state["last_success_at"] = (
-        datetime.now().astimezone().isoformat(timespec="seconds")
-    )
-
-    save_json(STATE_FILE, state)
-
-    return bool(items)
-
-
-def record_error(config: dict[str, str], error: Exception) -> None:
-    state = load_json(STATE_FILE, default_state())
-
-    count = int(state.get("consecutive_errors", 0)) + 1
-    state["consecutive_errors"] = count
-
-    log(f"Error ({count} consecutive): {error}")
-
-    # One warning after roughly one hour of continuous failures.
-    if count >= 6 and not state.get("error_alerted"):
-        try:
-            send_telegram(
-                config["bot_token"],
-                config["chat_id"],
-                (
-                    f"⚠️ پایش نوبت {config['doctor_name']} "
-                    "چند بار پیاپی با خطا مواجه شده است. "
-                    "لطفاً اینترنت یا وضعیت برنامه را بررسی کنید."
-                ),
-            )
-            state["error_alerted"] = True
-
-        except Exception as telegram_error:
-            log(f"Failed to send Telegram error notification: {telegram_error}")
-
-    save_json(STATE_FILE, state)
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
 def show_main_menu() -> str:
     print("\n=== Doctor Appointment Watcher ===\n")
     print("1) Start watcher")
-    print("2) Configure another doctor")
+    print("2) Configure doctors")
     print("3) Exit")
 
     choice = input("\nChoose an option [1]: ").strip() or "1"
@@ -629,36 +725,16 @@ def show_main_menu() -> str:
     return choice
 
 
-def config_exists() -> bool:
-    config = load_json(CONFIG_FILE, {})
-
-    required_keys = (
-        "doctor_name",
-        "doctor_id",
-        "doctor_url",
-        "bot_token",
-        "chat_id",
-    )
-
-    return all(str(config.get(key, "")).strip() for key in required_keys)
-
-
-def reset_state() -> None:
-    try:
-        STATE_FILE.unlink()
-    except FileNotFoundError:
-        pass
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Watch a supported doctor appointment page and notify Telegram."
+        description="Watch supported doctor appointment pages, compare "
+                    "availability and notify Telegram."
     )
 
     parser.add_argument(
         "--setup",
         action="store_true",
-        help="Configure a doctor and Telegram settings.",
+        help="Configure doctors and Telegram settings.",
     )
     parser.add_argument(
         "--test",
@@ -668,7 +744,7 @@ def main() -> int:
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Check once and exit.",
+        help="Check all providers once, print the comparison and exit.",
     )
 
     args = parser.parse_args()
@@ -687,7 +763,11 @@ def main() -> int:
                 config["chat_id"],
                 (
                     "Test message received.\n\n"
-                    f"Doctor: {config['doctor_name']}"
+                    f"Watching: "
+                    + ", ".join(
+                        f"{t['doctor_name']} ({t['provider']})"
+                        for t in config["targets"]
+                    )
                 ),
             )
             print("Test message sent.")
@@ -695,12 +775,8 @@ def main() -> int:
 
         if args.once:
             config = load_config()
-
-            try:
-                check_once(config)
-            except Exception as exc:
-                record_error(config, exc)
-
+            results = check_all(config)
+            print_comparison(results)
             return 0
 
         # First run: automatically start initial setup.
@@ -722,24 +798,16 @@ def main() -> int:
             return 0
 
         config = load_config()
+        interval = int(config["check_interval_seconds"])
 
-        interval = int(
-            load_json(CONFIG_FILE, {}).get(
-                "check_interval_seconds",
-                CHECK_INTERVAL_SECONDS,
-            )
+        doctors = ", ".join(
+            f"{t['doctor_name']} ({t['provider']})" for t in config["targets"]
         )
-
-        log(
-            f"Watching {config['doctor_name']} "
-            f"every {interval // 60} minute(s)."
-        )
+        log(f"Watching {doctors} every {interval // 60} minute(s).")
 
         while True:
-            try:
-                check_once(config)
-            except Exception as exc:
-                record_error(config, exc)
+            results = check_all(config)
+            print_comparison(results)
 
             time.sleep(interval)
 

@@ -4,39 +4,44 @@
   <a href="./README.fa.md">🇮🇷 فارسی</a>
 </p>
 
-# # **Doctor Appointment Watcher**
+# **Doctor Appointment Watcher**
 
-A lightweight Python tool that monitors supported doctor appointment pages and sends a Telegram notification when an available appointment is detected.
+A lightweight Python tool that monitors doctor appointment pages on supported platforms, compares availability side by side in the terminal, and sends a Telegram notification when a new available appointment is detected.
 
-The project currently supports **DoctorTo** and is designed to gradually support more appointment platforms through community contributions.
+Supported platforms: **Doctoreto** (`doctoreto.com`) and **Paziresh24** (`paziresh24.com`). More platforms can be added through community contributions.
 
 ## **Features**
 
-* Monitor a doctor’s appointment page automatically
-* Detect newly available appointments
-* Send Telegram notifications
-* Avoid duplicate notifications for the same availability
-* Persist configuration locally
-* Reconfigure and monitor another doctor at any time
-* Run continuously with a configurable checking interval
-* Persian/Unicode doctor names are supported
+* Monitor one doctor per supported platform at the same time
+* Side-by-side availability comparison in the terminal
+* Independent per-provider and per-doctor monitoring state
+* Telegram notifications with official booking links
+* No duplicate notifications for the same availability
+* A failure on one platform never hides results from the other
+* Persist configuration locally; upgrade from old single-doctor configs automatically
+* Reconfigure doctors at any time
+* Configurable checking interval
+* Persian/Unicode doctor names and URLs are supported
 * Termux-friendly
 * Uses only the Python standard library
-* Designed for community-driven support for additional platforms
+* No automatic booking — you always book on the official website
+
 ## **Supported Platforms**
 
-|  **Platform**  |  **Status**  | 
-|---|---|
-|  DoctorTo (`doctoreto.com`)  |  ✅ Supported  | 
-|  Paziresh24 (`paziresh24.com`)  |  🚧 Planned  | 
-|  Other platforms  |  🤝 Community contributions welcome  |
+|  **Platform**  |  **Status**  |  **Data source**  |
+|---|---|---|
+|  Doctoreto (`doctoreto.com`)  |  ✅ Supported  |  Public doctor page (`__NEXT_DATA__`)  |
+|  Paziresh24 (`paziresh24.com`)  |  ✅ Supported  |  Public doctor page (`__NEXT_DATA__` / `samanDoctorAvailabilityStatus`)  |
+|  Other platforms  |  🤝 Community contributions welcome  |  —  |
+
 ## **Requirements**
 
-* Termux on Android
+* Termux on Android (or any machine with Python ≥ 3.10)
 * Internet connection
-* A supported doctor’s appointment page
+* A doctor's page on a supported platform
 * A Telegram bot
-Python does not need to be installed manually. The setup script checks for Python and installs it automatically when necessary.
+
+Python does not need to be installed manually on Termux. The setup script checks for Python and installs it automatically when necessary.
 
 ## **Installation**
 
@@ -54,7 +59,11 @@ chmod +x setup.sh
 ./setup.sh
 ```
 
-The setup script prepares the Termux environment and starts the application.
+The setup script prepares the Termux environment and starts the application. On a regular Linux/macOS machine you can skip it and run the watcher directly:
+
+```
+python3 appointment_watcher.py
+```
 
 ## **First Run**
 
@@ -62,23 +71,29 @@ On the first run, no previous configuration exists, so the application automatic
 
 You will be asked for:
 
-1. Doctor appointment page URL
-2. Doctor name (Persian is supported)
+1. A doctor URL for each platform you want to watch (press Enter on an empty line to finish)
+2. Doctor names (auto-detected from the page; Persian is supported)
 3. Telegram bot token
 4. Telegram chat
-5. Checking interval
 
-⠀
 Example:
 
 ```
-=== Doctoreto Appointment Watcher Setup ===
+=== Doctor Appointment Watcher Setup ===
+
+Supported providers: doctoreto, paziresh24
 
 Doctor URL:
-> https://doctoreto.com/doctor/...
+> https://doctoreto.com/doctor/tehran/...
 
-Doctor name:
-> نام و نام خانوادگی دکتر
+Detected doctor name: نام و نام خانوادگی دکتر
+Doctor ID extracted automatically: ...
+
+Doctor URL (empty line to finish):
+> https://paziresh24.com/dr/دکتر-...
+
+Doctor URL (empty line to finish):
+>
 
 Telegram Bot Token:
 > ********
@@ -88,7 +103,9 @@ Open your bot in Telegram and press Start.
 Setup completed successfully.
 ```
 
-The configuration is stored locally so you do not need to enter it every time.
+You can watch a single platform or both — one doctor per platform, up to one target per provider. Providing a second URL for the same provider replaces the previous one.
+
+The configuration is stored locally so you do not need to enter it every time. Existing single-doctor configurations from older versions are migrated automatically; nothing is lost.
 
 ## **Running the Watcher**
 
@@ -107,97 +124,141 @@ python appointment_watcher.py
 When an existing configuration is found, the application shows:
 
 ```
-=== Doctoreto Appointment Watcher ===
+=== Doctor Appointment Watcher ===
 
 1) Start watcher
-2) Configure another doctor
+2) Configure doctors
 3) Exit
 ```
 
 ### **Start Watcher**
 
-Select:
+Select `1`. Every configured provider is checked each cycle and a comparison is printed:
 
 ```
-1
+=== Appointment comparison (2026-11-13 11:19) ===
+
+doctoreto — دکتر علی رضایی
+  ❌ No open appointments
+
+paziresh24 — پزشک نمونه
+  ✅ 2 open slot(s):
+  • مطب نمونه | 2026-12-01 10:30
+  • ویزیت آنلاین پذیرش24 | 2026-11-14 15:00
+  Book on the official site: https://paziresh24.com/dr/...
 ```
 
-The current doctor will be monitored.
-
-### **Configure Another Doctor**
-
-Select:
+If one provider fails (network error, page structure change), the other provider's results are still shown and monitored:
 
 ```
-2
+doctoreto — دکتر علی رضایی
+  ⚠️ Check failed: Connection failed: HTTP Error 404: Not Found
 ```
 
-The previous doctor configuration is replaced with the new one and the previous monitoring state is reset.
+### **One-Shot Check**
 
-This allows the same installation to be reused for another doctor without manually deleting configuration files.
+```
+python appointment_watcher.py --once
+```
+
+Checks every configured provider once, prints the comparison and exits. Useful for testing or cron-based setups.
+
+### **Telegram Test Message**
+
+```
+python appointment_watcher.py --test
+```
+
+### **Configure Doctors**
+
+Select `2` to run setup again. The previous configuration is replaced and monitoring state is reset.
 
 ### **Exit**
 
-Select:
-
-```
-3
-```
+Select `3`.
 
 ## **Stop the Watcher**
 
-Press:
+Press `Ctrl + C`.
 
-```
-Ctrl + C
-```
-
-On Termux, when a physical Ctrl key is not available, you can usually use:
-
-```
-Volume Down + C
-```
+On Termux, when a physical Ctrl key is not available, you can usually use `Volume Down + C`.
 
 ## **How It Works**
 
 ```
-Doctor URL
+Doctor URLs (one per provider)
     ↓
-Detect supported platform
+Detect provider from each URL
     ↓
-Fetch doctor page
+Fetch public doctor page (per provider)
     ↓
-Extract doctor and appointment information
+Extract availability (per provider)
     ↓
-Check availability
+Normalize into the shared appointment model
     ↓
-Compare with previous state
+Compare with that target's previous state
     ↓
-New appointment?
-   ↙       ↘
- YES        NO
-  ↓          ↓
-Telegram    Continue
-notification
+New availability?
+   ↙              ↘
+ YES               NO
+  ↓                 ↓
+Telegram alert   Continue
+(official link)
 ```
 
-A small local state file is used to prevent duplicate notifications.
+* Each provider + doctor pair has its **own** state entry, so one provider's availability can never suppress another provider's notifications.
+* A local state file prevents duplicate notifications: the same open slots are reported once; when slots disappear the fingerprint resets, so a genuinely new slot triggers a new alert.
+* If a provider fails repeatedly (about one hour of consecutive errors), a single Telegram warning is sent.
 
 ## **Configuration and Privacy**
 
-The application stores its configuration locally.
+The application stores its configuration in `~/.config/doctoreto-watcher/config.json` (the historical path is kept for compatibility).
 
-The configuration may contain:
+```json
+{
+  "version": 2,
+  "check_interval_seconds": 600,
+  "bot_token": "...",
+  "chat_id": "...",
+  "targets": [
+    {
+      "provider": "doctoreto",
+      "doctor_name": "نام دکتر",
+      "doctor_id": "...",
+      "doctor_url": "https://doctoreto.com/doctor/..."
+    },
+    {
+      "provider": "paziresh24",
+      "doctor_name": "نام دکتر",
+      "doctor_id": "دکتر-...",
+      "doctor_url": "https://paziresh24.com/dr/..."
+    }
+  ]
+}
+```
 
-* Doctor information
-* Doctor URL
-* Telegram bot token
-* Telegram chat ID
 The configuration file is protected with restricted file permissions where supported.
 
 **Never share or commit your configuration files or Telegram bot token.**
 
 If a Telegram bot token is exposed, revoke it immediately using BotFather.
+
+## **Troubleshooting**
+
+| Symptom | What it means |
+|---|---|
+| `⚠️ Check failed: ...` in the comparison | That provider could not be checked (network, timeout, or the page structure changed). The other provider keeps working. |
+| Telegram warning "چند بار پیاپی با خطا مواجه شده است" | A provider failed for about an hour of consecutive checks. Check your internet connection. |
+| `Could not find ... The website structure may have changed.` | The provider's page no longer matches the expected structure; please open an issue. |
+| No alert although slots are visible in the browser | The alert for those exact slots was already sent (duplicate prevention). Wait for a genuinely new slot, or delete `~/.config/doctoreto-watcher/state.json` to reset fingerprints. |
+| `Configuration is incomplete` | Re-run `python appointment_watcher.py --setup`. |
+
+## **Known Limitations**
+
+* Doctoreto availability is read from the public page's embedded Next.js data; a website redesign can break parsing until the adapter is updated.
+* Paziresh24 availability is read from the public page's embedded `samanDoctorAvailabilityStatus` data: it reports the nearest bookable time slot per clinic/online-visit, not the full list of all slots.
+* Appointment prices are not exposed by either provider's public pages; the model keeps price *unknown* rather than guessing.
+* Availability may change at any moment; the watcher reports what the page showed at check time and never books.
 
 ## **Security**
 
@@ -205,11 +266,11 @@ Never commit:
 
 * Telegram bot tokens
 * Private chat IDs
-* Cookies
-* Session credentials
+* Cookies or session credentials
 * API keys
 * Personal configuration files
-This project does not require storing medical records or medical history.
+
+This project does not require storing medical records or medical history, does not log in to any provider, and does not send credentials to any provider website.
 
 ## **Responsible Use**
 
@@ -221,27 +282,24 @@ Users are responsible for complying with:
 * Applicable rate limits
 * Applicable laws and regulations
 * Any restrictions imposed by the monitored platform
-Use reasonable checking intervals and avoid unnecessary traffic.
+
+Use reasonable checking intervals (the default is 10 minutes) and avoid unnecessary traffic.
 
 The project does not automatically book appointments.
 
 ## **Adding Support for a New Platform**
 
-The long-term goal is to support multiple appointment platforms while keeping the user experience simple.
-
-Users should only need to provide a doctor URL. The application should detect the supported platform automatically.
+The application detects the platform automatically from the doctor URL.
 
 Contributors can help by implementing the website-specific logic required to:
 
-* Detect the platform
+* Detect the platform (host names)
 * Validate and normalize doctor URLs
 * Identify the doctor
-* Extract appointment information
-* Determine availability
+* Extract appointment information from the public page
 * Normalize the result into the common appointment format
-Shared monitoring, configuration and Telegram logic should remain platform-independent.
 
-See `CONTRIBUTING.md` for contribution guidelines.
+Shared monitoring, configuration and Telegram logic remains platform-independent. See `CONTRIBUTING.md` for guidelines and `providers/paziresh24.py` for a documented example adapter.
 
 ## **Contributing**
 
@@ -251,12 +309,11 @@ To add support for a new appointment platform:
 
 1. Fork the repository
 2. Create a feature branch
-3. Implement the platform-specific logic
-4. Test the integration
+3. Implement the platform-specific logic in `providers/`
+4. Add tests with captured page fixtures (`tests/fixtures/`)
 5. Update the supported-platform documentation
 6. Submit a Pull Request
 
-⠀
 Example:
 
 ```
@@ -270,33 +327,45 @@ Please keep platform-specific logic isolated and avoid unnecessary changes to th
 ```
 doctor-appointment-watcher/
 │
-├── appointment_watcher.py
+├── appointment_watcher.py       # CLI and orchestration entry point
+├── providers/
+│   ├── __init__.py              # Provider registry and URL detection
+│   ├── base.py                  # Shared HTTP, Next.js helpers, provider contract
+│   ├── model.py                 # Provider-neutral appointment model
+│   ├── doctoreto.py             # Doctoreto adapter
+│   └── paziresh24.py            # Paziresh24 adapter (documented data source)
+├── tests/                       # unittest suite (offline, mocked HTTP)
+│   ├── fixtures/                # Real captured provider pages
+│   └── test_*.py
 ├── setup.sh
 ├── README.md
 ├── CONTRIBUTING.md
 └── LICENSE
 ```
 
+Run the tests with:
+
+```
+python -m unittest discover -s tests -t .
+```
+
+Tests are fully offline (HTTP and Telegram are mocked) and include real captured pages from both providers.
+
 ## **Roadmap**
 
-* DoctorTo support
-* Telegram notifications
-* Duplicate notification prevention
-* Persistent configuration
-* Reconfigure another doctor
-* Termux setup script
-* Automatic platform detection
-* Paziresh24 support
+* ~~Doctoreto support~~ ✅
+* ~~Paziresh24 support~~ ✅
+* ~~Automatic platform detection~~ ✅
+* ~~Multi-provider adapter architecture~~ ✅
+* ~~Automated tests~~ ✅
 * More appointment platforms
-* Cleaner multi-platform adapter architecture
-* Automated tests
-* Improved error handling
 * Cross-platform setup support
+
 ## **Disclaimer**
 
 This project is an independent open-source project.
 
-It is not affiliated with or endorsed by DoctorTo or any other supported appointment platform.
+It is not affiliated with or endorsed by Doctoreto, Paziresh24 or any other supported appointment platform.
 
 Appointment availability may change at any time.
 
